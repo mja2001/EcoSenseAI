@@ -1,0 +1,2 @@
+AWSIoTPythonSDK
+adafruit-circuitpython-dht  # Optional for real DHT22

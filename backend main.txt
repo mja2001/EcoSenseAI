@@ -1,0 +1,85 @@
+from fastapi import FastAPI, WebSocket, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer
+from pydantic import BaseModel
+from pymongo import MongoClient
+from dotenv import load_dotenv
+import os
+from models.schemas import SensorData
+from models.predictor import predict_co2_spike
+from utils.report_gen import generate_pdf_report
+from db.mongo_utils import get_collection
+from awsiotpython sdk import AWSIoTMQTTClient  # For MQTT subscription (merged from first doc)
+import time
+import json
+
+load_dotenv()
+app = FastAPI(title="EcoSenseAI API")
+
+# CORS
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+security = HTTPBearer()  # JWT stub
+
+collection = get_collection()
+
+class IngestResponse(BaseModel):
+    status: str
+    prediction: str
+
+# MQTT Subscription (added from first doc for auto-ingestion)
+def setup_mqtt():
+    client = AWSIoTMQTTClient("backend-subscriber")
+    client.configureEndpoint(os.getenv("AWS_IOT_ENDPOINT"))
+    client.configureCredentials(os.getenv("AWS_CA_PATH"), os.getenv("AWS_KEY_PATH"), os.getenv("AWS_CERT_PATH"))
+    client.connect()
+    client.subscribe("env/data", 1, on_message)
+    return client
+
+def on_message(client, userdata, message):
+    payload = json.loads(message.payload.decode())
+    data = SensorData(**payload)
+    data_dict = data.dict()
+    pred, pred_value = predict_co2_spike(data_dict['co2'])
+    data_dict['prediction'] = pred
+    collection.insert_one(data_dict)
+    # Broadcast via WS if needed
+
+mqtt_client = setup_mqtt()  # Subscribe on startup
+
+@app.post("/ingest", response_model=IngestResponse)
+async def ingest_data(data: SensorData):
+    try:
+        data_dict = data.dict()
+        prediction, pred_value = predict_co2_spike(data_dict.get('co2', 0))
+        data_dict['prediction'] = prediction
+        collection.insert_one(data_dict)
+        return IngestResponse(status="ingested", prediction=prediction)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/data")
+async def get_data(limit: int = 100, token: str = Depends(security)):
+    # Auth stub: Validate token (extend with real JWT decode)
+    if token.credentials != "valid-token":  # Placeholder
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return list(collection.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit))
+
+@app.get("/report/pdf")
+async def get_report():
+    data = list(collection.find({}, {"_id": 0}).limit(50))
+    pdf_path = generate_pdf_report(data)
+    return {"report_url": f"/static/{pdf_path}"}  # Serve static PDF
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            parsed_data = SensorData(**json.loads(data))
+            prediction, pred_value = predict_co2_spike(parsed_data.co2)
+            parsed_data.prediction = prediction
+            await websocket.send_json(parsed_data.dict())  # Send back enriched data
+    except Exception as e:
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=str(e))

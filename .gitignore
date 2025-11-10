@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+*.crt
+*.key
+*.pem
+.DS_Store
+coverage/
+build/
+dist/
+*.log
+data/*.csv  # Keep sample, ignore real data
+.h5  # AI models
